@@ -1,0 +1,4 @@
+{
+  "_how_to_use": "Map a Discord USERNAME to their exact in-game name when their server nickname can't match. Example below. Delete the example line if you don't need it.",
+  "example_discord_username": "ExampleInGameName"
+}
