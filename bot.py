@@ -22,7 +22,7 @@ from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 
-from roles_logic import Settings, decide, fmt_power, normalize, weekly_gains
+from roles_logic import Settings, days_offline, decide, fmt_power, inactivity_groups, normalize, weekly_gains
 
 BASE = Path(__file__).parent
 load_dotenv(BASE / ".env")
@@ -54,6 +54,11 @@ CHECK_MINUTES = env_int("CHECK_MINUTES", 60)
 TZ = ZoneInfo(env("TIMEZONE", "America/Chicago"))
 WEEKLY_DAY = env_int("WEEKLY_DAY", 0)  # 0 = Monday
 WEEKLY_HOUR = env_int("WEEKLY_HOUR", 10)
+INACTIVE_TIERS = tuple(int(x) for x in env("INACTIVE_DAYS", "1,2,4,6").split(",") if x.strip())
+INACTIVITY_HOUR = env_int("INACTIVITY_HOUR", 9)
+# Optional daily standings post. Off until STANDINGS_CHANNEL_ID is set.
+STANDINGS_CHANNEL_ID = env_int("STANDINGS_CHANNEL_ID")
+STANDINGS_HOUR = env_int("STANDINGS_HOUR", 9)
 
 SETTINGS = Settings(
     arch_min=env_int("ARCH_MIN", 22_000_000),
@@ -98,7 +103,7 @@ def find_members(payload) -> list[dict]:
 
 async def fetch_roster(session: aiohttp.ClientSession) -> dict[str, dict]:
     headers = {"X-API-Key": TRACKER_API_KEY, "User-Agent": "JTF-Raphael-Bot/1.0 (Discord role sync)"}
-    async with session.get(API_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+    async with session.get(API_URL, params={"fresh": "1"}, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
         if resp.status == 429:
             raise RuntimeError("Tracker API daily limit reached (429). Will try again next check.")
         if resp.status in (401, 403):
@@ -109,12 +114,19 @@ async def fetch_roster(session: aiohttp.ClientSession) -> dict[str, dict]:
     if not members:
         raise RuntimeError("Tracker API answered but no 'members' list was found.")
     roster = {}
-    print("Roster sample:", [m.get("name") for m in members[:5]], "| fields:", sorted(members[0].keys()))
+    print("Online fields (first 3):", [(m.get("nick_name"), m.get("online"), m.get("last_online_at"), m.get("active")) for m in members[:3]])
+    print("last_online_at filled for", sum(1 for m in members if m.get("last_online_at")), "of", len(members), "| online flag true for", sum(1 for m in members if m.get("online")))
+    print("Roster sample:", [m.get("nick_name") or m.get("name") for m in members[:5]], "| count:", len(members))
     for m in members:
-        name = m.get("name") or m.get("nickname") or m.get("player_name") or m.get("username")
+        name = m.get("nick_name") or m.get("name") or m.get("nickname") or m.get("player_name") or m.get("username")
         power = m.get("power")
         if name and power is not None:
-            roster[normalize(name)] = {"name": name, "power": float(power)}
+            roster[normalize(name)] = {
+                "name": name, "power": float(power),
+                "last_online": m.get("last_online_at"), "online": bool(m.get("online")),
+                "active": m.get("active"), "tech": m.get("daily_tech"), "honor": m.get("daily_honor"),
+                "kills": m.get("kills"), "rank": m.get("rank_label") or m.get("rank_code") or "",
+            }
     return roster
 
 
@@ -127,6 +139,7 @@ class Raphael(discord.Client):
         self.session: aiohttp.ClientSession | None = None
         self.data = load_json(DATA_FILE, {"history": {}, "last_weekly": "", "last_unmatched_report": ""})
         self.lock = asyncio.Lock()
+        self.last_roster: dict[str, dict] = {}
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
@@ -165,6 +178,8 @@ class Raphael(discord.Client):
             if guild is None:
                 return "I'm not in a server yet."
             roster = await fetch_roster(self.session)
+            self.track_presence(roster)
+            self.last_roster = roster
             overrides = {k.lower(): v for k, v in load_json(OVERRIDES_FILE, {}).items()}
             self.record_history(roster)
 
@@ -226,6 +241,87 @@ class Raphael(discord.Client):
         self.data.setdefault("history", {})[today] = {p["name"]: p["power"] for p in roster.values()}
         for day in sorted(self.data["history"])[:-15]:  # keep ~2 weeks
             del self.data["history"][day]
+        # hourly stats snapshot: daily values keep their highest reading of the day
+        stats = self.data.setdefault("stats", {}).setdefault(today, {})
+        for p in roster.values():
+            old = stats.get(p["name"], {})
+            stats[p["name"]] = {
+                "tech": max(p.get("tech") or 0, old.get("tech", 0)),
+                "honor": max(p.get("honor") or 0, old.get("honor", 0)),
+                "kills": p.get("kills") or old.get("kills", 0),
+                "power": p["power"], "active": p.get("active") or 0,
+            }
+        for day in sorted(self.data["stats"])[:-15]:
+            del self.data["stats"][day]
+        save_json(DATA_FILE, self.data)
+
+    def ranking_text(self, stat: str, top: int = 10) -> str:
+        stats = self.data.get("stats", {})
+        days = sorted(stats)
+        if not days:
+            return "No data yet. Try again after the next check."
+        today = stats[days[-1]]
+        week = days[-7:]
+        label = {"tech": "Tech donated", "honor": "Honor", "kills": "Kills", "power": "Power", "active": "Weekly activity"}[stat]
+        out = []
+        def fmt(v):
+            return fmt_power(v) if stat in ("power", "kills") else f"{int(v):,}"
+        now_rows = sorted(((n, v.get(stat, 0)) for n, v in today.items()), key=lambda r: r[1], reverse=True)
+        out.append(f"**{label}: top {top} (latest reading)**")
+        out += [f"{i}. {n}: {fmt(v)}" for i, (n, v) in enumerate(now_rows[:top], 1)]
+        if stat in ("tech", "honor") and len(week) > 1:
+            tot = {}
+            for d in week:
+                for n, v in stats[d].items():
+                    tot[n] = tot.get(n, 0) + v.get(stat, 0)
+            rows = sorted(tot.items(), key=lambda r: r[1], reverse=True)[:top]
+            out.append(f"\n**{label}: top {top} over the last {len(week)} tracked days**")
+            out += [f"{i}. {n}: {int(v):,}" for i, (n, v) in enumerate(rows, 1)]
+        if stat in ("kills", "power") and len(days) > 1:
+            base = stats[days[0]]
+            gains = sorted(((n, v.get(stat, 0) - base[n].get(stat, 0)) for n, v in today.items() if n in base), key=lambda r: r[1], reverse=True)[:top]
+            out.append(f"\n**{label} gained since {days[0]}**")
+            out += [f"{i}. {n}: +{fmt(g)}" for i, (n, g) in enumerate(gains, 1) if g > 0]
+        if stat in ("tech", "honor"):
+            zero = [n for n, v in today.items() if not v.get(stat)]
+            out.append(f"\n_{len(zero)} members at 0 today._")
+        return "\n".join(out)
+
+    def standings_text(self, top: int = 3) -> str:
+        stats = self.data.get("stats", {})
+        days = sorted(stats)
+        if not days:
+            return ""
+        today = stats[days[-1]]
+        specs = [
+            ("power", ":crossed_swords: Power", lambda v: fmt_power(v)),
+            ("kills", ":dagger: Kills", lambda v: fmt_power(v)),
+            ("honor", ":medal: Honor", lambda v: f"{int(v):,}"),
+            ("active", ":fire: Weekly activity", lambda v: f"{int(v):,}"),
+            ("tech", ":test_tube: Tech donated", lambda v: f"{int(v):,}"),
+        ]
+        lines = [":bar_chart: **TEMPEST STANDINGS (daily)**"]
+        for key, label, fmt in specs:
+            rows = sorted(((n, v.get(key, 0)) for n, v in today.items()), key=lambda r: r[1], reverse=True)
+            rows = [(n, v) for n, v in rows[:top] if v]
+            if rows:
+                lines.append(f"{label}: " + ", ".join(f"{n} {fmt(v)}" for n, v in rows))
+        if len(lines) == 1:
+            return ""
+        lines.append("\nCheck your own numbers with /might or /rankings. Keep climbing, Tempest!")
+        return "\n".join(lines)
+
+    async def maybe_standings(self):
+        if not STANDINGS_CHANNEL_ID:
+            return
+        now = datetime.now(TZ)
+        today = now.date().isoformat()
+        if now.hour < STANDINGS_HOUR or self.data.get("last_standings") == today:
+            return
+        text = self.standings_text()
+        if text:
+            await self.post(STANDINGS_CHANNEL_ID, text)
+        self.data["last_standings"] = today
         save_json(DATA_FILE, self.data)
 
     async def maybe_weekly(self):
@@ -238,7 +334,79 @@ class Raphael(discord.Client):
             lines = [f"{i}. **{n}** +{fmt_power(g)} (now {fmt_power(p)})" for i, (n, g, p) in enumerate(gains, 1)]
             await self.post(SHOUTOUT_CHANNEL_ID, ":chart_with_upwards_trend: **BIGGEST GROWERS THIS WEEK** :chart_with_upwards_trend:\n" + "\n".join(lines)
                             + "\n\nArch Demon 22M+ | Greater Demon 16M+. Who's next?")
+        stats = self.data.get("stats", {})
+        week = sorted(stats)[-7:]
+        tot = {}
+        for d in week:
+            for n, v in stats[d].items():
+                tot[n] = tot.get(n, 0) + v.get("tech", 0)
+        top = [(n, t) for n, t in sorted(tot.items(), key=lambda r: r[1], reverse=True)[:5] if t > 0]
+        if top and len(week) >= 2:
+            lines = [f"{i}. **{n}**: {int(t):,} tech" for i, (n, t) in enumerate(top, 1)]
+            await self.post(SHOUTOUT_CHANNEL_ID, ":gem: **TOP DONORS THIS WEEK** :gem:\n" + "\n".join(lines)
+                            + "\n\nThank you for powering up the alliance!")
         self.data["last_weekly"] = today
+        save_json(DATA_FILE, self.data)
+
+    def track_presence(self, roster: dict[str, dict]):
+        """The tracker sends no last-online times, so remember when each member was last seen online."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        seen = self.data.setdefault("seen", {})
+        since = self.data.setdefault("tracking_since", now_iso)
+        prev = self.data.setdefault("active_prev", {})
+        for key, m in roster.items():
+            act = m.get("active")
+            changed = act is not None and key in prev and prev[key] != act
+            if act is not None:
+                prev[key] = act
+            if m.get("online") or changed:
+                seen[key] = now_iso
+            if not m.get("last_online"):
+                # never seen online yet: count from when tracking began (a minimum, not exact)
+                m["last_online"] = seen.get(key, since)
+        save_json(DATA_FILE, self.data)
+
+    def inactivity_text(self, roster: dict[str, dict], always: bool = False) -> str:
+        now_utc = datetime.now(timezone.utc)
+        groups = inactivity_groups(roster, now_utc, INACTIVE_TIERS)
+        tiers = sorted(groups)
+
+        def label(i: int, t: int) -> str:
+            top = i == len(tiers) - 1
+            if top:
+                return f"{t}+ days offline: leadership decides on a kick"
+            nxt = tiers[i + 1] - 1
+            span = f"{t} day" if nxt <= t else f"{t}-{nxt} days"
+            note = "message them in-game" if i == len(tiers) - 2 else "heads up"
+            return f"{span} offline: {note}"
+
+        parts = []
+        for i in reversed(range(len(tiers))):
+            rows = groups[tiers[i]]
+            if rows:
+                lines = [f"- {n}{f' ({r})' if r else ''}: {d} day{'s' if d != 1 else ''}" for n, r, d in rows]
+                parts.append(f"**{label(i, tiers[i])}** ({len(rows)})\n" + "\n".join(lines))
+        known = sum(1 for m in roster.values() if days_offline(m, now_utc) is not None)
+        unknown = len(roster) - known
+        if not parts and (always or known == 0):
+            if known == 0:
+                sample = next((m.get("last_online") for m in roster.values() if m.get("last_online")), None)
+                parts.append(f"I couldn't read anyone's last-online time. Sample value from the tracker: {sample!r}")
+            else:
+                parts.append(f"Everyone has been online within the last {tiers[0]} day(s).")
+        if parts:
+            parts.append(f"_Checked {known} of {len(roster)} members" + (f"; {unknown} {'has' if unknown == 1 else 'have'} no last-online data._" if unknown else "._"))
+        return "\n\n".join(parts)
+
+    async def maybe_inactivity(self):
+        now = datetime.now(TZ)
+        today = now.date().isoformat()
+        if now.hour < INACTIVITY_HOUR or self.data.get("last_inactivity_report") == today or not self.last_roster:
+            return
+        text = self.inactivity_text(self.last_roster)
+        if text and "Checked" in text and not text.startswith("Everyone"):
+            await self.post(LOG_CHANNEL_ID, ":zzz: **Daily inactivity report**\n\n" + text)
+        self.data["last_inactivity_report"] = today
         save_json(DATA_FILE, self.data)
 
     @tasks.loop(minutes=60)
@@ -246,6 +414,8 @@ class Raphael(discord.Client):
         try:
             await self.sync_roles("hourly")
             await self.maybe_weekly()
+            await self.maybe_inactivity()
+            await self.maybe_standings()
         except Exception as e:  # keep the loop alive
             log.exception("Check failed")
             await self.post(LOG_CHANNEL_ID, f":warning: Raphael check failed: {e}")
@@ -267,22 +437,114 @@ def register_commands(bot: Raphael):
             result = f"Failed: {e}"
         await interaction.followup.send(result[:1900] or "Done.", ephemeral=True)
 
+    @bot.tree.command(name="inactive", description="Show members who have been offline 1, 2, 4 and 6+ days")
+    @app_commands.default_permissions(manage_roles=True)
+    async def inactive(interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            roster = await fetch_roster(bot.session)
+            bot.track_presence(roster)
+            text = bot.inactivity_text(roster, always=True)
+        except Exception as e:
+            text = f"Failed: {e}"
+        await interaction.followup.send(text[:1900], ephemeral=True)
+
+    @bot.tree.command(name="rankings", description="Top members by tech donated, honor, kills, power or activity")
+    @app_commands.describe(stat="Which ranking to show")
+    @app_commands.choices(stat=[
+        app_commands.Choice(name="Tech donated", value="tech"),
+        app_commands.Choice(name="Honor", value="honor"),
+        app_commands.Choice(name="Kills", value="kills"),
+        app_commands.Choice(name="Power", value="power"),
+        app_commands.Choice(name="Weekly activity", value="active"),
+    ])
+    async def rankings(interaction: discord.Interaction, stat: app_commands.Choice[str]):
+        await interaction.response.defer(ephemeral=False, thinking=True)
+        try:
+            text = bot.ranking_text(stat.value)
+        except Exception as e:
+            text = f"Failed: {e}"
+        await interaction.followup.send(text[:1900], ephemeral=False)
+
     @bot.tree.command(name="might", description="Look up a JTF member's might and role tier")
     @app_commands.describe(name="In-game name")
     async def might(interaction: discord.Interaction, name: str):
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(ephemeral=False)
         try:
             roster = await fetch_roster(bot.session)
         except Exception as e:
-            await interaction.followup.send(f"Couldn't reach the tracker: {e}", ephemeral=True)
+            await interaction.followup.send(f"Couldn't reach the tracker: {e}", ephemeral=False)
             return
         p = roster.get(normalize(name))
         if not p:
             sample = ", ".join(v["name"] for v in list(roster.values())[:5]) or "(empty)"
-            await interaction.followup.send(f"No one named '{name}' on the JTF roster. Roster has {len(roster)} names, e.g. {sample}", ephemeral=True)
+            await interaction.followup.send(f"No one named '{name}' on the JTF roster. Roster has {len(roster)} names, e.g. {sample}", ephemeral=False)
             return
         from roles_logic import role_for_power
-        await interaction.followup.send(f"**{p['name']}**: {fmt_power(p['power'])} → {role_for_power(p['power'], SETTINGS)}", ephemeral=True)
+        await interaction.followup.send(f"**{p['name']}**: {fmt_power(p['power'])} → {role_for_power(p['power'], SETTINGS)}", ephemeral=False)
+
+    # --- Named Monster role (members of the in-game Named Monsters group chat) ---
+    NM_ROLE = env("NAMED_MONSTER_ROLE", "Named Monster")
+    nm = app_commands.Group(
+        name="namedmonster",
+        description="Manage the Named Monster role",
+        default_permissions=discord.Permissions(manage_roles=True),
+        guild_only=True,
+    )
+
+    async def nm_change(interaction: discord.Interaction, member: discord.Member, add: bool):
+        await interaction.response.defer(ephemeral=True)
+        role = discord.utils.get(interaction.guild.roles, name=NM_ROLE)
+        if role is None:
+            await interaction.followup.send(f"I can't find a role named '{NM_ROLE}'.", ephemeral=True)
+            return
+        if member.bot:
+            await interaction.followup.send("Bots can't be Named Monsters.", ephemeral=True)
+            return
+        has_role = role in member.roles
+        if add and has_role:
+            await interaction.followup.send(f"{member.display_name} is already a Named Monster.", ephemeral=True)
+            return
+        if not add and not has_role:
+            await interaction.followup.send(f"{member.display_name} isn't a Named Monster.", ephemeral=True)
+            return
+        try:
+            reason = f"/namedmonster {'add' if add else 'remove'} by {interaction.user}"
+            if add:
+                await member.add_roles(role, reason=reason)
+            else:
+                await member.remove_roles(role, reason=reason)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                f"I'm not allowed to change that role. Move my Raphael role above '{NM_ROLE}' in Server Settings > Roles.",
+                ephemeral=True,
+            )
+            return
+        verb = "added to" if add else "removed from"
+        await interaction.followup.send(f"{member.display_name} {verb} {NM_ROLE}.", ephemeral=True)
+        await bot.post(LOG_CHANNEL_ID, f":smiling_imp: **{NM_ROLE}**: {member.display_name} {verb} the role by {interaction.user.display_name}.")
+
+    @nm.command(name="add", description="Give a member the Named Monster role")
+    @app_commands.describe(member="Discord member who is in the in-game Named Monsters group")
+    async def nm_add(interaction: discord.Interaction, member: discord.Member):
+        await nm_change(interaction, member, True)
+
+    @nm.command(name="remove", description="Remove the Named Monster role from a member")
+    @app_commands.describe(member="Discord member to remove")
+    async def nm_remove(interaction: discord.Interaction, member: discord.Member):
+        await nm_change(interaction, member, False)
+
+    @nm.command(name="list", description="List current Named Monsters")
+    async def nm_list(interaction: discord.Interaction):
+        role = discord.utils.get(interaction.guild.roles, name=NM_ROLE)
+        if role is None:
+            await interaction.response.send_message(f"I can't find a role named '{NM_ROLE}'.", ephemeral=True)
+            return
+        names = sorted(m.display_name for m in role.members)
+        text = f"**{NM_ROLE}** ({len(names)}): " + (", ".join(names) or "nobody yet")
+        await interaction.response.send_message(text[:1900], ephemeral=True)
+
+    bot.tree.add_command(nm)
 
 
 if __name__ == "__main__":

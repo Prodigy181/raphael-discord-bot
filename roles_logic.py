@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
 
@@ -128,3 +129,46 @@ def weekly_gains(history: dict[str, dict[str, float]], today: str, days: int = 7
     gains = [(n, now[n] - base[n], now[n]) for n in now if n in base]
     gains.sort(key=lambda g: g[1], reverse=True)
     return [g for g in gains if g[1] > 0][:top]
+
+
+def parse_last_online(raw, now: datetime) -> datetime | None:
+    """Accept epoch seconds, epoch milliseconds, or an ISO date string. Returns an aware UTC time, or None."""
+    if raw is None or raw == "":
+        return None
+    try:
+        if isinstance(raw, (int, float)) or (isinstance(raw, str) and raw.strip().replace(".", "", 1).isdigit()):
+            value = float(raw)
+            if value > 1e11:  # milliseconds
+                value /= 1000
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        text = str(raw).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def days_offline(member: dict, now: datetime) -> float | None:
+    """Days since the member was last online. 0 if online now, None if unknown."""
+    if member.get("online"):
+        return 0.0
+    seen = parse_last_online(member.get("last_online"), now)
+    if seen is None:
+        return None
+    return max((now - seen).total_seconds() / 86400, 0.0)
+
+
+def inactivity_groups(roster: dict, now: datetime, tiers=(2, 4, 6)):
+    """Return {tier_days: [(name, rank, whole_days), ...]} with each member in the highest tier they reach."""
+    tiers = sorted(tiers)
+    groups = {t: [] for t in tiers}
+    for m in roster.values():
+        d = days_offline(m, now)
+        if d is None:
+            continue
+        hit = [t for t in tiers if d >= t]
+        if hit:
+            groups[hit[-1]].append((m["name"], m.get("rank") or "", int(d)))
+    for t in groups:
+        groups[t].sort(key=lambda x: -x[2])
+    return groups

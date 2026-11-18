@@ -31,7 +31,12 @@ It also:
 - Posts once a day in your log channel with anyone whose nickname doesn't match the roster.
 - Posts **RANK UP!** in main chat when someone is promoted.
 - Posts the week's **Biggest Growers** every Monday at 10 AM Central.
-- Adds two slash commands: `/syncroles` (check now; admins and officers only) and `/might <name>`.
+- Posts a **daily inactivity report** in your log channel: members offline 1 day, 2-3 days (heads up), 4-5 days (message them in-game) and 6+ days (leadership decides on a kick).
+- Optional **daily standings post** (top 3 for power, kills, honor, weekly activity and tech donated). Off until `STANDINGS_CHANNEL_ID` is set in `.env`; `STANDINGS_HOUR` sets the time.
+- Adds slash commands:
+  - `/might <name>` and `/rankings <stat>` (tech donated, honor, kills, power, weekly activity) for anyone, with public replies.
+  - `/inactive` (inactivity list) for Named Monsters and officers, `/syncroles` (check now) for officers.
+  - `/namedmonster add|remove|list` to manage the Named Monster role (officers).
 
 ---
 
@@ -61,9 +66,9 @@ Unzip this folder somewhere simple, like `C:\RaphaelBot`.
 3. Save the file. **Never share `.env`.** It holds your secrets.
 
 ### 5. Prepare the server
-1. **Role order** (Server Settings → Roles): drag **Raphael** so it sits **below Primordial** and **above Arch Demon**.
+1. **Role order** (Server Settings → Roles): drag **Raphael** so it sits **below Primordial** and **above Named Monster, Arch Demon, Greater Demon and Lesser Demon** (a bot can only manage roles below its own).
 2. **Named Monster role**: create a role called exactly `Named Monster` (no color, no permissions). Give it to the in-game Named Monsters who are in the Discord.
-3. **Log channel access**: #executive-chat is private. Go to Edit Channel → Permissions, add the Raphael role, and allow View Channel and Send Messages.
+3. **Log channel access**: the leadership channel (ours is #named-monsters-hall) is private. Go to Edit Channel → Permissions, add the Raphael role, and allow View Channel and Send Messages.
 
 ### 6. Run it in test mode
 In the black window, run:
@@ -94,6 +99,7 @@ Edit `.env` and restart the bot:
 - `GRANDFATHER_ARCH`: Discord usernames that always keep Arch Demon.
 - `AUTO_VERIFY=true`: Goblins and Wanderers whose nicknames match get their role automatically.
 - `WEEKLY_DAY` / `WEEKLY_HOUR`: when the Biggest Growers post goes out.
+- `STANDINGS_CHANNEL_ID` / `STANDINGS_HOUR`: where and when the optional daily standings post goes out (leave the channel blank to keep it off).
 
 ## Troubleshooting
 | Message | Fix |
